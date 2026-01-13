@@ -1,0 +1,21 @@
+{
+  "name": "Vaeloris Document Forge",
+  "short_name": "Vaeloris Forge",
+  "description": "Transform your documents with the beautiful Vaeloris aesthetic",
+  "start_url": "/index.html",
+  "display": "standalone",
+  "background_color": "#F7F3EB",
+  "theme_color": "#2C5F7C",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
