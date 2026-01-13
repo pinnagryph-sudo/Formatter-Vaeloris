@@ -608,7 +608,7 @@ function generateDocument(elements) {
         
         // Create sidebar table
         children.push(new Table({
-          width: { size: 100, type: WidthType.PERCENTAGE },
+          width: { size: 5000, type: WidthType.PERCENTAGE },
           rows: [
             new TableRow({
               children: [
@@ -676,7 +676,7 @@ function generateDocument(elements) {
 
         children.push(new Paragraph({ spacing: { after: 120 } }));
         children.push(new Table({
-          width: { size: 100, type: WidthType.PERCENTAGE },
+          width: { size: 5000, type: WidthType.PERCENTAGE },
           rows: tableRows
         }));
         children.push(new Paragraph({ spacing: { after: 200 } }));
