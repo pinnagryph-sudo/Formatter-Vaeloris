@@ -49,37 +49,79 @@ async function parseDocxFile(file) {
   const parser = new DOMParser();
   const xmlDoc = parser.parseFromString(documentXml, 'text/xml');
   
-  const nsResolver = (prefix) => {
-    const ns = { 'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main' };
-    return ns[prefix] || null;
-  };
+  const NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
   
   const elements = [];
-  const paragraphs = xmlDoc.getElementsByTagNameNS(
-    'http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'p'
-  );
+  
+  // Get the document body
+  const body = xmlDoc.getElementsByTagNameNS(NS, 'body')[0];
+  if (!body) return elements;
+  
+  // Helper to extract text from an element
+  const extractText = (el) => {
+    const textNodes = el.getElementsByTagNameNS(NS, 't');
+    let text = '';
+    for (let t of textNodes) text += t.textContent || '';
+    return text.trim();
+  };
+  
+  // Helper to parse a Word table
+  const parseWordTable = (tbl) => {
+    const rows = tbl.getElementsByTagNameNS(NS, 'tr');
+    const tableData = [];
+    
+    for (let row of rows) {
+      const cells = row.getElementsByTagNameNS(NS, 'tc');
+      const rowData = [];
+      for (let cell of cells) {
+        rowData.push(extractText(cell));
+      }
+      if (rowData.some(c => c)) tableData.push(rowData);
+    }
+    
+    if (tableData.length >= 2) {
+      return {
+        type: 'table',
+        headers: tableData[0],
+        data: tableData.slice(1)
+      };
+    }
+    return null;
+  };
+  
+  // Iterate through body children (paragraphs AND tables)
+  const bodyChildren = body.childNodes;
   
   let isFirstParagraphAfterChapter = false;
   let currentSidebar = null;
   
-  for (let i = 0; i < paragraphs.length; i++) {
-    const para = paragraphs[i];
+  for (let i = 0; i < bodyChildren.length; i++) {
+    const node = bodyChildren[i];
+    
+    // Handle Word tables
+    if (node.localName === 'tbl') {
+      // Finish any pending sidebar
+      if (currentSidebar) {
+        elements.push(currentSidebar);
+        currentSidebar = null;
+      }
+      
+      const tableEl = parseWordTable(node);
+      if (tableEl) elements.push(tableEl);
+      continue;
+    }
+    
+    // Only process paragraph elements
+    if (node.localName !== 'p') continue;
+    
+    const para = node;
     
     // Get paragraph style
-    const pStyleEl = para.getElementsByTagNameNS(
-      'http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'pStyle'
-    )[0];
+    const pStyleEl = para.getElementsByTagNameNS(NS, 'pStyle')[0];
     const style = pStyleEl ? pStyleEl.getAttribute('w:val') : 'BodyText';
     
     // Get all text content
-    const textNodes = para.getElementsByTagNameNS(
-      'http://schemas.openxmlformats.org/wordprocessingml/2006/main', 't'
-    );
-    let text = '';
-    for (let t of textNodes) {
-      text += t.textContent || '';
-    }
-    text = text.trim();
+    const text = extractText(para);
     
     if (!text) continue;
     
@@ -183,41 +225,8 @@ async function parseDocxFile(file) {
       continue;
     }
     
-    // Check for table rows (pipes)
-    if (text.includes('|') && text.startsWith('|')) {
-      // Handle table - collect consecutive pipe-containing paragraphs
-      const tableRows = [text];
-      while (i + 1 < paragraphs.length) {
-        const nextPara = paragraphs[i + 1];
-        const nextTextNodes = nextPara.getElementsByTagNameNS(
-          'http://schemas.openxmlformats.org/wordprocessingml/2006/main', 't'
-        );
-        let nextText = '';
-        for (let t of nextTextNodes) nextText += t.textContent || '';
-        nextText = nextText.trim();
-        
-        if (nextText.includes('|') && nextText.startsWith('|')) {
-          tableRows.push(nextText);
-          i++;
-        } else {
-          break;
-        }
-      }
-      
-      // Parse table
-      const parsedRows = tableRows
-        .filter(row => !/^\|[\s-:]+\|$/.test(row.replace(/\|/g, '|')))
-        .map(row => row.split('|').slice(1, -1).map(c => c.trim()));
-      
-      if (parsedRows.length >= 2) {
-        elements.push({
-          type: 'table',
-          headers: parsedRows[0],
-          data: parsedRows.slice(1)
-        });
-      }
-      continue;
-    }
+    // Check for table rows (markdown-style pipes) - only for .md/.txt files
+    // Word tables are handled above as <w:tbl> elements
     
     // Bullet points
     if (text.match(/^[\d]+\.\s+/) || text.match(/^[-•]\s+/)) {
