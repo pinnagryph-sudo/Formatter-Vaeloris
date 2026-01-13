@@ -1,8 +1,8 @@
-const { useState, useCallback, useRef, useEffect } = React;
+const { useState, useCallback, useRef } = React;
 const { 
   Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, 
   BorderStyle, WidthType, AlignmentType, VerticalAlign, ShadingType,
-  PageBreak, HeadingLevel, convertInchesToTwip
+  PageBreak, convertInchesToTwip
 } = docx;
 
 // ============================================================
@@ -39,7 +39,223 @@ const SIDEBAR_STYLES = {
 };
 
 // ============================================================
-// DOCUMENT PARSER
+// DOCX PARSER - Extracts structure from Word XML
+// ============================================================
+async function parseDocxFile(file) {
+  const arrayBuffer = await file.arrayBuffer();
+  const zip = await JSZip.loadAsync(arrayBuffer);
+  const documentXml = await zip.file('word/document.xml').async('string');
+  
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(documentXml, 'text/xml');
+  
+  const nsResolver = (prefix) => {
+    const ns = { 'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main' };
+    return ns[prefix] || null;
+  };
+  
+  const elements = [];
+  const paragraphs = xmlDoc.getElementsByTagNameNS(
+    'http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'p'
+  );
+  
+  let isFirstParagraphAfterChapter = false;
+  let currentSidebar = null;
+  
+  for (let i = 0; i < paragraphs.length; i++) {
+    const para = paragraphs[i];
+    
+    // Get paragraph style
+    const pStyleEl = para.getElementsByTagNameNS(
+      'http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'pStyle'
+    )[0];
+    const style = pStyleEl ? pStyleEl.getAttribute('w:val') : 'BodyText';
+    
+    // Get all text content
+    const textNodes = para.getElementsByTagNameNS(
+      'http://schemas.openxmlformats.org/wordprocessingml/2006/main', 't'
+    );
+    let text = '';
+    for (let t of textNodes) {
+      text += t.textContent || '';
+    }
+    text = text.trim();
+    
+    if (!text) continue;
+    
+    // Check for sidebar start pattern in any paragraph
+    const sidebarMatch = text.match(/^SIDEBAR\s*\[([A-Z])\]:\s*(.+?)(?:\s*\(Reliability:\s*([^)]+)\))?$/i);
+    if (sidebarMatch) {
+      // Save any previous sidebar
+      if (currentSidebar) {
+        elements.push(currentSidebar);
+      }
+      currentSidebar = {
+        type: 'sidebar',
+        code: sidebarMatch[1].toUpperCase(),
+        title: sidebarMatch[2].trim(),
+        reliability: sidebarMatch[3] || '',
+        source: '',
+        compiledFrom: '',
+        appliesTo: '',
+        quote: ''
+      };
+      continue;
+    }
+    
+    // If we're in a sidebar, collect its content
+    if (currentSidebar) {
+      if (text.startsWith('Source:')) {
+        currentSidebar.source = text.replace('Source:', '').trim();
+        continue;
+      } else if (text.startsWith('Compiled from:')) {
+        currentSidebar.compiledFrom = text.replace('Compiled from:', '').trim();
+        continue;
+      } else if (text.startsWith('Applies to:')) {
+        currentSidebar.appliesTo = text.replace('Applies to:', '').trim();
+        continue;
+      } else if (text.startsWith('"') || text.startsWith('"') || text.startsWith("'")) {
+        currentSidebar.quote = text.replace(/^["'"]+|["'"]+$/g, '');
+        // End sidebar after quote
+        elements.push(currentSidebar);
+        currentSidebar = null;
+        continue;
+      } else if (style === 'Heading2' || style === 'Heading3' || text.match(/^Chapter\s+\d+:/i)) {
+        // New section started, end sidebar
+        elements.push(currentSidebar);
+        currentSidebar = null;
+        // Fall through to process this element
+      } else {
+        // Might be continuation or quote without quotes
+        if (!currentSidebar.quote && !text.startsWith('Principle')) {
+          currentSidebar.quote = text;
+          elements.push(currentSidebar);
+          currentSidebar = null;
+          continue;
+        }
+      }
+    }
+    
+    // Process by Word style
+    if (style === 'Heading1' || text.match(/^BOOK\s+(ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|\d+)/i)) {
+      const bookMatch = text.match(/^BOOK\s+(ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|\d+)[:\s]*(.*)$/i);
+      if (bookMatch) {
+        elements.push({ 
+          type: 'bookTitle', 
+          number: bookMatch[1], 
+          title: bookMatch[2] || '' 
+        });
+      } else {
+        elements.push({ type: 'bookTitle', number: '', title: text });
+      }
+      continue;
+    }
+    
+    // Chapter detection
+    const chapterMatch = text.match(/^Chapter\s+(\d+)[:\s]*(.*)$/i);
+    if (chapterMatch || (style === 'Heading2' && text.toLowerCase().includes('chapter'))) {
+      if (chapterMatch) {
+        elements.push({ 
+          type: 'chapter', 
+          number: chapterMatch[1], 
+          title: chapterMatch[2] || '' 
+        });
+      } else {
+        elements.push({ type: 'chapter', number: '', title: text });
+      }
+      isFirstParagraphAfterChapter = true;
+      continue;
+    }
+    
+    // Subtitle (Heading2 that's not a chapter)
+    if (style === 'Heading2' && !text.toLowerCase().includes('chapter')) {
+      elements.push({ type: 'subtitle', text: text });
+      continue;
+    }
+    
+    // Section headers (Heading3, Heading4)
+    if (style === 'Heading3') {
+      elements.push({ type: 'header', level: 3, text: text });
+      continue;
+    }
+    if (style === 'Heading4') {
+      elements.push({ type: 'header', level: 4, text: text });
+      continue;
+    }
+    
+    // Check for table rows (pipes)
+    if (text.includes('|') && text.startsWith('|')) {
+      // Handle table - collect consecutive pipe-containing paragraphs
+      const tableRows = [text];
+      while (i + 1 < paragraphs.length) {
+        const nextPara = paragraphs[i + 1];
+        const nextTextNodes = nextPara.getElementsByTagNameNS(
+          'http://schemas.openxmlformats.org/wordprocessingml/2006/main', 't'
+        );
+        let nextText = '';
+        for (let t of nextTextNodes) nextText += t.textContent || '';
+        nextText = nextText.trim();
+        
+        if (nextText.includes('|') && nextText.startsWith('|')) {
+          tableRows.push(nextText);
+          i++;
+        } else {
+          break;
+        }
+      }
+      
+      // Parse table
+      const parsedRows = tableRows
+        .filter(row => !/^\|[\s-:]+\|$/.test(row.replace(/\|/g, '|')))
+        .map(row => row.split('|').slice(1, -1).map(c => c.trim()));
+      
+      if (parsedRows.length >= 2) {
+        elements.push({
+          type: 'table',
+          headers: parsedRows[0],
+          data: parsedRows.slice(1)
+        });
+      }
+      continue;
+    }
+    
+    // Bullet points
+    if (text.match(/^[\d]+\.\s+/) || text.match(/^[-•]\s+/)) {
+      elements.push({ 
+        type: 'bullet', 
+        text: text.replace(/^[\d]+\.\s+/, '').replace(/^[-•]\s+/, '') 
+      });
+      continue;
+    }
+    
+    // Definition pattern (Term: value)
+    const defMatch = text.match(/^([A-Z][^:]{2,30}):\s+(.+)$/);
+    if (defMatch && !text.includes('SIDEBAR')) {
+      elements.push({ type: 'definition', term: defMatch[1], value: defMatch[2] });
+      continue;
+    }
+    
+    // First paragraph after chapter gets drop cap
+    if ((style === 'FirstParagraph' || isFirstParagraphAfterChapter) && /^[A-Z]/.test(text)) {
+      elements.push({ type: 'dropCapParagraph', text: text });
+      isFirstParagraphAfterChapter = false;
+      continue;
+    }
+    
+    // Regular paragraph
+    elements.push({ type: 'paragraph', text: text });
+  }
+  
+  // Don't forget any trailing sidebar
+  if (currentSidebar) {
+    elements.push(currentSidebar);
+  }
+  
+  return elements;
+}
+
+// ============================================================
+// MARKDOWN PARSER (for .md and .txt files)
 // ============================================================
 function parseMarkdownContent(text) {
   const lines = text.split('\n');
@@ -51,89 +267,100 @@ function parseMarkdownContent(text) {
     const line = lines[i];
     const trimmed = line.trim();
 
-    // Skip empty lines
-    if (!trimmed) {
-      i++;
-      continue;
-    }
+    if (!trimmed) { i++; continue; }
 
-    // Book title (# BOOK X or # Title)
+    // Book title
     if (/^#\s+BOOK\s+/i.test(trimmed)) {
       const match = trimmed.match(/^#\s+BOOK\s+(\w+)[:\s]*(.*)$/i);
-      if (match) {
-        elements.push({ type: 'bookTitle', number: match[1], title: match[2] || '' });
-      }
-      i++;
-      continue;
+      if (match) elements.push({ type: 'bookTitle', number: match[1], title: match[2] || '' });
+      i++; continue;
     }
 
-    // Chapter header (## Chapter X: Title)
+    // Chapter header
     if (/^##\s+Chapter\s+/i.test(trimmed)) {
       const match = trimmed.match(/^##\s+Chapter\s+(\d+)[:\s]*(.*)$/i);
       if (match) {
         elements.push({ type: 'chapter', number: match[1], title: match[2] || '' });
         isFirstParagraphAfterChapter = true;
       }
-      i++;
-      continue;
+      i++; continue;
     }
 
-    // Section headers
+    // Headers
     if (trimmed.startsWith('####')) {
       elements.push({ type: 'header', level: 4, text: trimmed.replace(/^####\s*/, '') });
-      i++;
-      continue;
+      i++; continue;
     }
     if (trimmed.startsWith('###')) {
       elements.push({ type: 'header', level: 3, text: trimmed.replace(/^###\s*/, '') });
-      i++;
-      continue;
+      i++; continue;
     }
     if (trimmed.startsWith('##')) {
       elements.push({ type: 'header', level: 2, text: trimmed.replace(/^##\s*/, '') });
-      i++;
+      i++; continue;
+    }
+
+    // Sidebar with markdown markers
+    if (/^\*\*SIDEBAR\s*\[([A-Z])\]/i.test(trimmed)) {
+      const headerMatch = trimmed.match(/^\*\*SIDEBAR\s*\[([A-Z])\]:\s*([^*]*)\*\*(?:\s*\(Reliability:\s*([^)]+)\))?/i);
+      if (headerMatch) {
+        const sidebar = {
+          type: 'sidebar',
+          code: headerMatch[1].toUpperCase(),
+          title: headerMatch[2].trim(),
+          reliability: headerMatch[3] || '',
+          source: '', compiledFrom: '', appliesTo: '', quote: ''
+        };
+        i++;
+        while (i < lines.length) {
+          const sLine = lines[i].trim();
+          if (!sLine || sLine.startsWith('##') || sLine.startsWith('**SIDEBAR')) break;
+          if (sLine.startsWith('Source:')) sidebar.source = sLine.replace('Source:', '').trim();
+          else if (sLine.startsWith('Compiled from:')) sidebar.compiledFrom = sLine.replace('Compiled from:', '').trim();
+          else if (sLine.startsWith('Applies to:')) sidebar.appliesTo = sLine.replace('Applies to:', '').trim();
+          else if (sLine.startsWith('_"') || sLine.startsWith('*"') || sLine.startsWith('"')) {
+            sidebar.quote = sLine.replace(/^[_*"]+|[_*"]+$/g, '');
+          }
+          i++;
+        }
+        elements.push(sidebar);
+        continue;
+      }
+    }
+
+    // Table
+    if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
+      const rows = [];
+      while (i < lines.length) {
+        const tLine = lines[i].trim();
+        if (!tLine.startsWith('|')) break;
+        if (!/^\|[\s-:]+\|$/.test(tLine.replace(/\|/g, '|'))) {
+          const cells = tLine.split('|').slice(1, -1).map(c => c.trim());
+          if (cells.length > 0) rows.push(cells);
+        }
+        i++;
+      }
+      if (rows.length >= 2) elements.push({ type: 'table', headers: rows[0], data: rows.slice(1) });
       continue;
     }
 
-    // Sidebar detection (**SIDEBAR [X]: ...)
-    if (/^\*\*SIDEBAR\s*\[([A-Z])\]/i.test(trimmed)) {
-      const sidebar = parseSidebar(lines, i);
-      if (sidebar) {
-        elements.push(sidebar.element);
-        i = sidebar.endIndex;
-        continue;
-      }
-    }
-
-    // Table detection
-    if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
-      const table = parseTable(lines, i);
-      if (table) {
-        elements.push(table.element);
-        i = table.endIndex;
-        continue;
-      }
-    }
-
-    // Bullet points
+    // Bullet
     if (/^[-*]\s+/.test(trimmed)) {
       elements.push({ type: 'bullet', text: trimmed.replace(/^[-*]\s+/, '') });
-      i++;
-      continue;
+      i++; continue;
     }
 
-    // Definition lines (Term: value or **Term:** value)
-    if (/^\*\*[^*]+\*\*:\s*/.test(trimmed) || /^[A-Z][^:]+:\s+/.test(trimmed)) {
-      const defMatch = trimmed.match(/^\*\*([^*]+)\*\*:\s*(.*)$/) || trimmed.match(/^([^:]+):\s+(.*)$/);
+    // Definition
+    if (/^\*\*[^*]+\*\*:\s*/.test(trimmed)) {
+      const defMatch = trimmed.match(/^\*\*([^*]+)\*\*:\s*(.*)$/);
       if (defMatch) {
         elements.push({ type: 'definition', term: defMatch[1], value: defMatch[2] });
-        i++;
-        continue;
+        i++; continue;
       }
     }
 
-    // Regular paragraph (with potential drop cap)
-    if (isFirstParagraphAfterChapter && trimmed.length > 0 && /^[A-Z]/.test(trimmed)) {
+    // Drop cap paragraph
+    if (isFirstParagraphAfterChapter && /^[A-Z]/.test(trimmed)) {
       elements.push({ type: 'dropCapParagraph', text: trimmed });
       isFirstParagraphAfterChapter = false;
     } else {
@@ -141,148 +368,19 @@ function parseMarkdownContent(text) {
     }
     i++;
   }
-
   return elements;
-}
-
-function parseSidebar(lines, startIndex) {
-  const firstLine = lines[startIndex].trim();
-  const headerMatch = firstLine.match(/^\*\*SIDEBAR\s*\[([A-Z])\]:\s*([^*]*)\*\*(?:\s*\(Reliability:\s*([^)]+)\))?/i);
-  
-  if (!headerMatch) return null;
-
-  const code = headerMatch[1].toUpperCase();
-  const title = headerMatch[2].trim();
-  const reliability = headerMatch[3] || '';
-  
-  let source = '', compiledFrom = '', appliesTo = '', quote = '';
-  let i = startIndex + 1;
-
-  while (i < lines.length) {
-    const line = lines[i].trim();
-    
-    if (!line || line.startsWith('##') || line.startsWith('**SIDEBAR')) {
-      break;
-    }
-
-    if (line.startsWith('Source:')) {
-      source = line.replace('Source:', '').trim();
-    } else if (line.startsWith('Compiled from:')) {
-      compiledFrom = line.replace('Compiled from:', '').trim();
-    } else if (line.startsWith('Applies to:')) {
-      appliesTo = line.replace('Applies to:', '').trim();
-    } else if (line.startsWith('_"') || line.startsWith('*"') || line.startsWith('"')) {
-      quote = line.replace(/^[_*"]+|[_*"]+$/g, '');
-    }
-    
-    i++;
-  }
-
-  return {
-    element: {
-      type: 'sidebar',
-      code,
-      title,
-      reliability,
-      source,
-      compiledFrom,
-      appliesTo,
-      quote
-    },
-    endIndex: i
-  };
-}
-
-function parseTable(lines, startIndex) {
-  const rows = [];
-  let i = startIndex;
-
-  while (i < lines.length) {
-    const line = lines[i].trim();
-    
-    if (!line.startsWith('|')) break;
-    
-    // Skip separator row (|---|---|)
-    if (/^\|[\s-:]+\|$/.test(line.replace(/\|/g, '|'))) {
-      i++;
-      continue;
-    }
-
-    const cells = line
-      .split('|')
-      .slice(1, -1)
-      .map(cell => cell.trim());
-    
-    if (cells.length > 0) {
-      rows.push(cells);
-    }
-    i++;
-  }
-
-  if (rows.length < 2) return null;
-
-  return {
-    element: {
-      type: 'table',
-      headers: rows[0],
-      data: rows.slice(1)
-    },
-    endIndex: i
-  };
 }
 
 // ============================================================
 // DOCX GENERATOR
 // ============================================================
-function cleanMarkdown(text) {
+function cleanText(text) {
   return text
     .replace(/\*\*([^*]+)\*\*/g, '$1')
     .replace(/\*([^*]+)\*/g, '$1')
     .replace(/_([^_]+)_/g, '$1')
-    .replace(/\\_/g, '_')
     .replace(/---/g, '—')
     .replace(/--/g, '–');
-}
-
-function createTextRuns(text, defaultStyle = {}) {
-  const runs = [];
-  let remaining = text;
-
-  // Process bold
-  const boldRegex = /\*\*([^*]+)\*\*/g;
-  let match;
-  let lastIndex = 0;
-
-  while ((match = boldRegex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      runs.push(new TextRun({
-        text: cleanMarkdown(text.slice(lastIndex, match.index)),
-        ...defaultStyle
-      }));
-    }
-    runs.push(new TextRun({
-      text: cleanMarkdown(match[1]),
-      bold: true,
-      ...defaultStyle
-    }));
-    lastIndex = boldRegex.lastIndex;
-  }
-
-  if (lastIndex < text.length) {
-    runs.push(new TextRun({
-      text: cleanMarkdown(text.slice(lastIndex)),
-      ...defaultStyle
-    }));
-  }
-
-  if (runs.length === 0) {
-    runs.push(new TextRun({
-      text: cleanMarkdown(text),
-      ...defaultStyle
-    }));
-  }
-
-  return runs;
 }
 
 function generateDocument(elements) {
@@ -294,71 +392,85 @@ function generateDocument(elements) {
         // Ornament
         children.push(new Paragraph({
           alignment: AlignmentType.CENTER,
-          spacing: { before: 2500, after: 200 },
+          spacing: { before: 1500, after: 200 },
           children: [new TextRun({ text: '·  ◊  ·', color: COLORS.copper, size: 32 })]
         }));
         // Book number
         children.push(new Paragraph({
           alignment: AlignmentType.CENTER,
           spacing: { after: 200 },
-          children: [new TextRun({ text: `BOOK ${el.number}`, bold: true, color: COLORS.deepSea, size: 72 })]
+          children: [new TextRun({ 
+            text: el.number ? `BOOK ${el.number.toUpperCase()}` : el.title, 
+            bold: true, 
+            color: COLORS.deepSea, 
+            size: 72 
+          })]
         }));
-        // Title
-        if (el.title) {
+        // Title if separate
+        if (el.number && el.title) {
           children.push(new Paragraph({
             alignment: AlignmentType.CENTER,
             spacing: { after: 100 },
-            children: [new TextRun({ text: el.title, italics: true, color: COLORS.stormGray, size: 44 })]
+            children: [new TextRun({ text: cleanText(el.title), italics: true, color: COLORS.stormGray, size: 44 })]
           }));
         }
         // Divider
         children.push(new Paragraph({
           alignment: AlignmentType.CENTER,
           spacing: { before: 200, after: 400 },
-          children: [new TextRun({ text: '─────────  ◊  ─────────', color: COLORS.copper })]
+          children: [new TextRun({ text: '─────────  ◊  ─────────', color: COLORS.copper, size: 20 })]
+        }));
+        break;
+
+      case 'subtitle':
+        children.push(new Paragraph({
+          alignment: AlignmentType.CENTER,
+          spacing: { after: 200 },
+          children: [new TextRun({ text: cleanText(el.text), color: COLORS.stormGray, size: 28 })]
         }));
         break;
 
       case 'chapter':
-        // Page break + ornament
-        children.push(new Paragraph({
-          children: [new PageBreak()]
-        }));
+        // Page break
+        children.push(new Paragraph({ children: [new PageBreak()] }));
+        // Ornament
         children.push(new Paragraph({
           alignment: AlignmentType.CENTER,
           spacing: { after: 80 },
           children: [new TextRun({ text: '·  ◊  ·', color: COLORS.copper, size: 32 })]
         }));
         // Chapter number
-        children.push(new Paragraph({
-          alignment: AlignmentType.CENTER,
-          spacing: { after: 60 },
-          children: [new TextRun({ text: `CHAPTER ${el.number}`, smallCaps: true, color: COLORS.stormGray, size: 24 })]
-        }));
+        if (el.number) {
+          children.push(new Paragraph({
+            alignment: AlignmentType.CENTER,
+            spacing: { after: 60 },
+            children: [new TextRun({ text: `CHAPTER ${el.number}`, smallCaps: true, color: COLORS.stormGray, size: 24 })]
+          }));
+        }
         // Chapter title
         children.push(new Paragraph({
           alignment: AlignmentType.CENTER,
           spacing: { after: 40 },
-          children: [new TextRun({ text: el.title, bold: true, color: COLORS.deepSea, size: 40 })]
+          children: [new TextRun({ text: cleanText(el.title), bold: true, color: COLORS.deepSea, size: 40 })]
         }));
         // Divider
         children.push(new Paragraph({
           alignment: AlignmentType.CENTER,
           spacing: { before: 80, after: 300 },
-          children: [new TextRun({ text: '─────────  ◊  ─────────', color: COLORS.copper })]
+          children: [new TextRun({ text: '─────────  ◊  ─────────', color: COLORS.copper, size: 20 })]
         }));
         break;
 
       case 'header':
+        const headerSizes = { 2: 30, 3: 30, 4: 22 };
         const headerColors = { 2: COLORS.deepSea, 3: COLORS.deepSea, 4: COLORS.stormGray };
-        const headerSizes = { 2: 30, 3: 24, 4: 22 };
         children.push(new Paragraph({
-          spacing: { before: el.level === 2 ? 360 : 280, after: el.level === 2 ? 180 : 140 },
+          spacing: { before: 360, after: 180 },
           children: [new TextRun({
-            text: cleanMarkdown(el.text),
+            text: cleanText(el.text),
             bold: true,
-            color: headerColors[el.level],
-            size: headerSizes[el.level]
+            color: headerColors[el.level] || COLORS.deepSea,
+            size: headerSizes[el.level] || 24
           })]
         }));
         break;
@@ -367,18 +479,20 @@ function generateDocument(elements) {
         const firstLetter = el.text[0];
         const restOfText = el.text.slice(1);
         children.push(new Paragraph({
+          alignment: AlignmentType.JUSTIFIED,
           spacing: { after: 240 },
           children: [
             new TextRun({ text: firstLetter, bold: true, color: COLORS.deepSea, size: 72 }),
-            ...createTextRuns(restOfText, { color: COLORS.darkGray, size: 24 })
+            new TextRun({ text: cleanText(restOfText), color: COLORS.darkGray, size: 24 })
           ]
         }));
         break;
 
       case 'paragraph':
         children.push(new Paragraph({
+          alignment: AlignmentType.JUSTIFIED,
           spacing: { after: 240 },
-          children: createTextRuns(el.text, { color: COLORS.darkGray, size: 24 })
+          children: [new TextRun({ text: cleanText(el.text), color: COLORS.darkGray, size: 24 })]
         }));
         break;
 
@@ -387,7 +501,7 @@ function generateDocument(elements) {
           spacing: { after: 120 },
           children: [
             new TextRun({ text: '• ', color: COLORS.copper, size: 24 }),
-            ...createTextRuns(el.text, { color: COLORS.darkGray, size: 24 })
+            new TextRun({ text: cleanText(el.text), color: COLORS.darkGray, size: 24 })
           ]
         }));
         break;
@@ -397,58 +511,93 @@ function generateDocument(elements) {
           spacing: { after: 200 },
           children: [
             new TextRun({ text: el.term + ': ', bold: true, color: COLORS.deepSea, size: 24 }),
-            new TextRun({ text: cleanMarkdown(el.value), color: COLORS.darkGray, size: 24 })
+            new TextRun({ text: cleanText(el.value), color: COLORS.darkGray, size: 24 })
           ]
         }));
         break;
 
       case 'sidebar':
         const style = SIDEBAR_STYLES[el.code] || { label: 'NOTE', color: COLORS.deepSea };
-        const sidebarRows = [];
+        const sidebarContent = [];
 
-        // Header row with label
-        const headerCells = [new Paragraph({
+        // Header with diamond and label
+        sidebarContent.push(new Paragraph({
+          spacing: { after: 60 },
           children: [
             new TextRun({ text: '◊ ', color: style.color, size: 24 }),
             new TextRun({ text: style.label, bold: true, smallCaps: true, color: style.color, size: 22 })
           ]
-        })];
+        }));
 
+        // Title if different
         if (el.title && el.title.toUpperCase() !== style.label) {
-          headerCells.push(new Paragraph({
-            spacing: { before: 40 },
-            children: [new TextRun({ text: el.title, bold: true, color: COLORS.darkGray, size: 20 })]
+          sidebarContent.push(new Paragraph({
+            spacing: { after: 40 },
+            children: [new TextRun({ text: cleanText(el.title), bold: true, color: COLORS.darkGray, size: 20 })]
           }));
         }
 
+        // Source
         if (el.source) {
-          headerCells.push(new Paragraph({
-            spacing: { before: 40 },
+          sidebarContent.push(new Paragraph({
+            spacing: { after: 40 },
             children: [
               new TextRun({ text: 'Source: ', bold: true, color: COLORS.darkGray, size: 20 }),
-              new TextRun({ text: el.source, color: COLORS.darkGray, size: 20 })
+              new TextRun({ text: cleanText(el.source), color: COLORS.darkGray, size: 20 })
             ]
           }));
         }
 
+        // Reliability
         if (el.reliability) {
-          headerCells.push(new Paragraph({
-            spacing: { before: 40 },
+          sidebarContent.push(new Paragraph({
+            spacing: { after: 40 },
             children: [
               new TextRun({ text: 'Reliability: ', bold: true, color: COLORS.darkGray, size: 20 }),
-              new TextRun({ text: el.reliability, color: COLORS.darkGray, size: 20 })
+              new TextRun({ text: cleanText(el.reliability), color: COLORS.darkGray, size: 20 })
             ]
           }));
         }
 
-        if (el.quote) {
-          headerCells.push(new Paragraph({
-            spacing: { before: 60 },
-            children: [new TextRun({ text: `"${cleanMarkdown(el.quote)}"`, italics: true, color: COLORS.darkGray, size: 22 })]
+        // Compiled from
+        if (el.compiledFrom) {
+          sidebarContent.push(new Paragraph({
+            spacing: { after: 40 },
+            children: [
+              new TextRun({ text: 'Compiled from: ', bold: true, color: COLORS.darkGray, size: 20 }),
+              new TextRun({ text: cleanText(el.compiledFrom), color: COLORS.darkGray, size: 20 })
+            ]
           }));
         }
 
+        // Applies to
+        if (el.appliesTo) {
+          sidebarContent.push(new Paragraph({
+            spacing: { after: 60 },
+            children: [
+              new TextRun({ text: 'Applies to: ', bold: true, color: COLORS.darkGray, size: 20 }),
+              new TextRun({ text: cleanText(el.appliesTo), color: COLORS.darkGray, size: 20 })
+            ]
+          }));
+        }
+
+        // Quote
+        if (el.quote) {
+          sidebarContent.push(new Paragraph({
+            spacing: { after: 40 },
+            children: [new TextRun({ 
+              text: `"${cleanText(el.quote)}"`, 
+              italics: true, 
+              color: COLORS.darkGray, 
+              size: 22 
+            })]
+          }));
+        }
+
+        // Add spacing before sidebar
         children.push(new Paragraph({ spacing: { after: 120 } }));
+        
+        // Create sidebar table
         children.push(new Table({
           width: { size: 100, type: WidthType.PERCENTAGE },
           rows: [
@@ -462,14 +611,21 @@ function generateDocument(elements) {
                     bottom: { style: BorderStyle.SINGLE, size: 6, color: COLORS.lightBorder },
                     right: { style: BorderStyle.SINGLE, size: 6, color: COLORS.lightBorder },
                   },
-                  margins: { top: 120, left: 200, bottom: 120, right: 200 },
-                  children: headerCells
+                  margins: { 
+                    top: convertInchesToTwip(0.08), 
+                    left: convertInchesToTwip(0.14), 
+                    bottom: convertInchesToTwip(0.08), 
+                    right: convertInchesToTwip(0.14) 
+                  },
+                  children: sidebarContent
                 })
               ]
             })
           ]
         }));
-        children.push(new Paragraph({ spacing: { after: 120 } }));
+        
+        // Spacing after sidebar
+        children.push(new Paragraph({ spacing: { after: 200 } }));
         break;
 
       case 'table':
@@ -481,9 +637,15 @@ function generateDocument(elements) {
           children: el.headers.map(h => new TableCell({
             shading: { fill: COLORS.deepSea, type: ShadingType.CLEAR },
             verticalAlign: VerticalAlign.CENTER,
+            borders: {
+              top: { style: BorderStyle.SINGLE, size: 8, color: COLORS.deepSea },
+              left: { style: BorderStyle.SINGLE, size: 8, color: COLORS.deepSea },
+              bottom: { style: BorderStyle.SINGLE, size: 8, color: COLORS.deepSea },
+              right: { style: BorderStyle.SINGLE, size: 8, color: COLORS.deepSea },
+            },
             children: [new Paragraph({
               alignment: AlignmentType.CENTER,
-              children: [new TextRun({ text: cleanMarkdown(h), bold: true, color: COLORS.white, size: 20 })]
+              children: [new TextRun({ text: cleanText(h), bold: true, color: COLORS.white, size: 20 })]
             })]
           }))
         }));
@@ -497,7 +659,7 @@ function generateDocument(elements) {
               verticalAlign: VerticalAlign.CENTER,
               children: [new Paragraph({
                 alignment: AlignmentType.CENTER,
-                children: [new TextRun({ text: cleanMarkdown(cell), color: COLORS.darkGray, size: 20 })]
+                children: [new TextRun({ text: cleanText(cell), color: COLORS.darkGray, size: 20 })]
               })]
             }))
           }));
@@ -508,7 +670,7 @@ function generateDocument(elements) {
           width: { size: 100, type: WidthType.PERCENTAGE },
           rows: tableRows
         }));
-        children.push(new Paragraph({ spacing: { after: 120 } }));
+        children.push(new Paragraph({ spacing: { after: 200 } }));
         break;
     }
   }
@@ -531,15 +693,14 @@ function generateDocument(elements) {
 }
 
 // ============================================================
-// REACT COMPONENTS
+// REACT APP
 // ============================================================
-
 function App() {
   const [file, setFile] = useState(null);
-  const [content, setContent] = useState('');
   const [elements, setElements] = useState([]);
   const [status, setStatus] = useState('idle');
   const [dragActive, setDragActive] = useState(false);
+  const [parseLog, setParseLog] = useState([]);
   const fileInputRef = useRef(null);
 
   const handleDrag = useCallback((e) => {
@@ -555,23 +716,40 @@ function App() {
   const processFile = useCallback(async (selectedFile) => {
     setFile(selectedFile);
     setStatus('parsing');
+    setParseLog([]);
 
     try {
+      let parsed;
+      const log = [];
+      
       if (selectedFile.name.endsWith('.docx')) {
-        const arrayBuffer = await selectedFile.arrayBuffer();
-        const result = await mammoth.extractRawText({ arrayBuffer });
-        setContent(result.value);
-        const parsed = parseMarkdownContent(result.value);
-        setElements(parsed);
+        log.push('Detected .docx file - parsing Word structure...');
+        parsed = await parseDocxFile(selectedFile);
+        log.push(`Found ${parsed.length} elements`);
       } else if (selectedFile.name.endsWith('.md') || selectedFile.name.endsWith('.txt')) {
+        log.push('Detected text file - parsing markdown...');
         const text = await selectedFile.text();
-        setContent(text);
-        const parsed = parseMarkdownContent(text);
-        setElements(parsed);
+        parsed = parseMarkdownContent(text);
+        log.push(`Found ${parsed.length} elements`);
+      } else {
+        throw new Error('Unsupported file type');
       }
+
+      // Count element types
+      const typeCounts = {};
+      parsed.forEach(el => {
+        typeCounts[el.type] = (typeCounts[el.type] || 0) + 1;
+      });
+      Object.entries(typeCounts).forEach(([type, count]) => {
+        log.push(`  • ${count} ${type}${count > 1 ? 's' : ''}`);
+      });
+
+      setParseLog(log);
+      setElements(parsed);
       setStatus('ready');
     } catch (error) {
       console.error('Error processing file:', error);
+      setParseLog([`Error: ${error.message}`]);
       setStatus('error');
     }
   }, []);
@@ -580,7 +758,6 @@ function App() {
     e.preventDefault();
     e.stopPropagation();
     setDragActive(false);
-
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       processFile(e.dataTransfer.files[0]);
     }
@@ -594,7 +771,6 @@ function App() {
 
   const handleGenerate = useCallback(async () => {
     setStatus('generating');
-    
     try {
       const doc = generateDocument(elements);
       const blob = await Packer.toBlob(doc);
@@ -609,12 +785,10 @@ function App() {
 
   const handleReset = useCallback(() => {
     setFile(null);
-    setContent('');
     setElements([]);
     setStatus('idle');
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-    }
+    setParseLog([]);
+    if (fileInputRef.current) fileInputRef.current.value = '';
   }, []);
 
   return (
@@ -629,10 +803,7 @@ function App() {
       <main style={styles.main}>
         {status === 'idle' && (
           <div
-            style={{
-              ...styles.dropzone,
-              ...(dragActive ? styles.dropzoneActive : {})
-            }}
+            style={{ ...styles.dropzone, ...(dragActive ? styles.dropzoneActive : {}) }}
             onDragEnter={handleDrag}
             onDragLeave={handleDrag}
             onDragOver={handleDrag}
@@ -648,19 +819,22 @@ function App() {
             />
             <div style={styles.dropzoneIcon}>◊</div>
             <h3 style={styles.dropzoneTitle}>Drop your manuscript here</h3>
-            <p style={styles.dropzoneText}>
-              Accepts .docx, .md, or .txt files
-            </p>
+            <p style={styles.dropzoneText}>Accepts .docx, .md, or .txt files</p>
             <div style={styles.dropzoneHint}>or click to browse</div>
           </div>
         )}
 
-        {(status === 'parsing' || status === 'generating') && (
+        {status === 'parsing' && (
           <div style={styles.loadingContainer}>
             <div style={styles.loadingSpinner}>◊</div>
-            <p style={styles.loadingText}>
-              {status === 'parsing' ? 'Parsing your manuscript...' : 'Forging your document...'}
-            </p>
+            <p style={styles.loadingText}>Parsing your manuscript...</p>
+          </div>
+        )}
+
+        {status === 'generating' && (
+          <div style={styles.loadingContainer}>
+            <div style={styles.loadingSpinner}>◊</div>
+            <p style={styles.loadingText}>Forging your document...</p>
           </div>
         )}
 
@@ -670,38 +844,46 @@ function App() {
               <div style={styles.fileIcon}>📜</div>
               <div>
                 <div style={styles.fileName}>{file?.name}</div>
-                <div style={styles.fileStats}>
-                  {elements.length} elements detected
-                </div>
+                <div style={styles.fileStats}>{elements.length} elements detected</div>
               </div>
             </div>
 
+            <div style={styles.logBox}>
+              <h4 style={styles.logTitle}>Parse Log</h4>
+              {parseLog.map((line, i) => (
+                <div key={i} style={styles.logLine}>{line}</div>
+              ))}
+            </div>
+
             <div style={styles.preview}>
-              <h4 style={styles.previewTitle}>Preview</h4>
+              <h4 style={styles.previewTitle}>Structure Preview</h4>
               <div style={styles.previewContent}>
-                {elements.slice(0, 10).map((el, i) => (
+                {elements.slice(0, 15).map((el, i) => (
                   <div key={i} style={styles.previewItem}>
-                    <span style={styles.previewType}>{el.type}</span>
+                    <span style={{
+                      ...styles.previewType,
+                      backgroundColor: el.type === 'sidebar' ? COLORS.copper :
+                                       el.type === 'chapter' ? COLORS.deepSea :
+                                       el.type === 'bookTitle' ? COLORS.deepSea :
+                                       el.type === 'table' ? COLORS.stormGray :
+                                       '#888'
+                    }}>{el.type}</span>
                     <span style={styles.previewText}>
-                      {el.title || el.text || el.term || `${el.headers?.length || 0} columns`}
+                      {el.title || el.text || el.term || 
+                       (el.type === 'sidebar' ? `[${el.code}] ${el.title}` : '') ||
+                       (el.type === 'table' ? `${el.headers?.length} cols × ${el.data?.length} rows` : '')}
                     </span>
                   </div>
                 ))}
-                {elements.length > 10 && (
-                  <div style={styles.previewMore}>
-                    ...and {elements.length - 10} more elements
-                  </div>
+                {elements.length > 15 && (
+                  <div style={styles.previewMore}>...and {elements.length - 15} more elements</div>
                 )}
               </div>
             </div>
 
             <div style={styles.buttonGroup}>
-              <button style={styles.secondaryButton} onClick={handleReset}>
-                ← Choose Different File
-              </button>
-              <button style={styles.primaryButton} onClick={handleGenerate}>
-                ◊ Forge Document
-              </button>
+              <button style={styles.secondaryButton} onClick={handleReset}>← Choose Different File</button>
+              <button style={styles.primaryButton} onClick={handleGenerate}>◊ Forge Document</button>
             </div>
           </div>
         )}
@@ -710,12 +892,8 @@ function App() {
           <div style={styles.successContainer}>
             <div style={styles.successIcon}>✓</div>
             <h3 style={styles.successTitle}>Document Forged!</h3>
-            <p style={styles.successText}>
-              Your styled document has been downloaded.
-            </p>
-            <button style={styles.primaryButton} onClick={handleReset}>
-              ◊ Forge Another
-            </button>
+            <p style={styles.successText}>Your styled document has been downloaded.</p>
+            <button style={styles.primaryButton} onClick={handleReset}>◊ Forge Another</button>
           </div>
         )}
 
@@ -723,21 +901,17 @@ function App() {
           <div style={styles.errorContainer}>
             <div style={styles.errorIcon}>✕</div>
             <h3 style={styles.errorTitle}>Something went wrong</h3>
-            <p style={styles.errorText}>
-              There was an error processing your file.
-            </p>
-            <button style={styles.primaryButton} onClick={handleReset}>
-              Try Again
-            </button>
+            <div style={styles.errorLog}>
+              {parseLog.map((line, i) => <div key={i}>{line}</div>)}
+            </div>
+            <button style={styles.primaryButton} onClick={handleReset}>Try Again</button>
           </div>
         )}
       </main>
 
       <footer style={styles.footer}>
         <div style={styles.footerOrnament}>◊</div>
-        <p style={styles.footerText}>
-          Styles: Deep Sea Teal · Copper Accents · Storm Gray · Warm Sand
-        </p>
+        <p style={styles.footerText}>Deep Sea Teal · Copper Accents · Storm Gray · Warm Sand</p>
       </footer>
     </div>
   );
@@ -754,10 +928,7 @@ const styles = {
     position: 'relative',
     zIndex: 1,
   },
-  header: {
-    textAlign: 'center',
-    padding: '60px 20px 40px',
-  },
+  header: { textAlign: 'center', padding: '60px 20px 40px' },
   ornament: {
     fontFamily: "'Cormorant Garamond', serif",
     fontSize: '24px',
@@ -777,7 +948,6 @@ const styles = {
     fontFamily: "'Raleway', sans-serif",
     fontSize: '16px',
     color: '#5A6978',
-    fontWeight: 400,
     marginBottom: '24px',
   },
   divider: {
@@ -786,13 +956,7 @@ const styles = {
     color: '#B87333',
     letterSpacing: '4px',
   },
-  main: {
-    flex: 1,
-    display: 'flex',
-    justifyContent: 'center',
-    alignItems: 'flex-start',
-    padding: '20px',
-  },
+  main: { flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'flex-start', padding: '20px' },
   dropzone: {
     width: '100%',
     maxWidth: '500px',
@@ -804,57 +968,16 @@ const styles = {
     textAlign: 'center',
     cursor: 'pointer',
     transition: 'all 0.3s ease',
-    animation: 'fadeInUp 0.6s ease-out',
   },
-  dropzoneActive: {
-    borderColor: '#2C5F7C',
-    backgroundColor: 'rgba(44, 95, 124, 0.05)',
-    transform: 'scale(1.02)',
-  },
-  dropzoneIcon: {
-    fontSize: '48px',
-    color: '#B87333',
-    marginBottom: '20px',
-    animation: 'float 2s ease-in-out infinite',
-  },
-  dropzoneTitle: {
-    fontFamily: "'Cormorant Garamond', serif",
-    fontSize: '24px',
-    fontWeight: 600,
-    color: '#2C5F7C',
-    marginBottom: '8px',
-  },
-  dropzoneText: {
-    fontSize: '14px',
-    color: '#5A6978',
-    marginBottom: '16px',
-  },
-  dropzoneHint: {
-    fontSize: '12px',
-    color: '#B87333',
-    fontStyle: 'italic',
-  },
-  loadingContainer: {
-    textAlign: 'center',
-    padding: '60px',
-    animation: 'fadeInUp 0.4s ease-out',
-  },
-  loadingSpinner: {
-    fontSize: '48px',
-    color: '#B87333',
-    animation: 'pulse 1.5s ease-in-out infinite',
-    marginBottom: '24px',
-  },
-  loadingText: {
-    fontFamily: "'Cormorant Garamond', serif",
-    fontSize: '20px',
-    color: '#5A6978',
-  },
-  previewContainer: {
-    width: '100%',
-    maxWidth: '600px',
-    animation: 'fadeInUp 0.6s ease-out',
-  },
+  dropzoneActive: { borderColor: '#2C5F7C', backgroundColor: 'rgba(44, 95, 124, 0.05)', transform: 'scale(1.02)' },
+  dropzoneIcon: { fontSize: '48px', color: '#B87333', marginBottom: '20px' },
+  dropzoneTitle: { fontFamily: "'Cormorant Garamond', serif", fontSize: '24px', fontWeight: 600, color: '#2C5F7C', marginBottom: '8px' },
+  dropzoneText: { fontSize: '14px', color: '#5A6978', marginBottom: '16px' },
+  dropzoneHint: { fontSize: '12px', color: '#B87333', fontStyle: 'italic' },
+  loadingContainer: { textAlign: 'center', padding: '60px' },
+  loadingSpinner: { fontSize: '48px', color: '#B87333', animation: 'pulse 1.5s ease-in-out infinite', marginBottom: '24px' },
+  loadingText: { fontFamily: "'Cormorant Garamond', serif", fontSize: '20px', color: '#5A6978' },
+  previewContainer: { width: '100%', maxWidth: '600px' },
   fileInfo: {
     display: 'flex',
     alignItems: 'center',
@@ -865,19 +988,24 @@ const styles = {
     marginBottom: '20px',
     boxShadow: '0 4px 20px rgba(44, 95, 124, 0.08)',
   },
-  fileIcon: {
-    fontSize: '32px',
+  fileIcon: { fontSize: '32px' },
+  fileName: { fontFamily: "'Cormorant Garamond', serif", fontSize: '18px', fontWeight: 600, color: '#2C5F7C' },
+  fileStats: { fontSize: '13px', color: '#5A6978' },
+  logBox: {
+    backgroundColor: 'rgba(255, 254, 249, 0.9)',
+    borderRadius: '12px',
+    padding: '16px 20px',
+    marginBottom: '20px',
+    boxShadow: '0 4px 20px rgba(44, 95, 124, 0.08)',
   },
-  fileName: {
+  logTitle: {
     fontFamily: "'Cormorant Garamond', serif",
-    fontSize: '18px',
+    fontSize: '14px',
     fontWeight: 600,
     color: '#2C5F7C',
+    marginBottom: '12px',
   },
-  fileStats: {
-    fontSize: '13px',
-    color: '#5A6978',
-  },
+  logLine: { fontSize: '12px', color: '#5A6978', fontFamily: 'monospace', lineHeight: 1.6 },
   preview: {
     backgroundColor: 'rgba(255, 254, 249, 0.9)',
     borderRadius: '12px',
@@ -894,47 +1022,21 @@ const styles = {
     paddingBottom: '12px',
     borderBottom: '1px solid #C9D1D9',
   },
-  previewContent: {
-    maxHeight: '300px',
-    overflowY: 'auto',
-  },
-  previewItem: {
-    display: 'flex',
-    alignItems: 'flex-start',
-    gap: '12px',
-    padding: '8px 0',
-    borderBottom: '1px solid rgba(201, 209, 217, 0.3)',
-  },
+  previewContent: { maxHeight: '300px', overflowY: 'auto' },
+  previewItem: { display: 'flex', alignItems: 'flex-start', gap: '12px', padding: '8px 0', borderBottom: '1px solid rgba(201, 209, 217, 0.3)' },
   previewType: {
     fontSize: '10px',
     fontWeight: 600,
     textTransform: 'uppercase',
     letterSpacing: '1px',
     color: '#FFFFFF',
-    backgroundColor: '#2C5F7C',
     padding: '2px 8px',
     borderRadius: '4px',
     flexShrink: 0,
   },
-  previewText: {
-    fontSize: '13px',
-    color: '#5A6978',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  },
-  previewMore: {
-    fontSize: '12px',
-    color: '#B87333',
-    fontStyle: 'italic',
-    textAlign: 'center',
-    paddingTop: '12px',
-  },
-  buttonGroup: {
-    display: 'flex',
-    gap: '12px',
-    justifyContent: 'center',
-  },
+  previewText: { fontSize: '13px', color: '#5A6978', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  previewMore: { fontSize: '12px', color: '#B87333', fontStyle: 'italic', textAlign: 'center', paddingTop: '12px' },
+  buttonGroup: { display: 'flex', gap: '12px', justifyContent: 'center' },
   primaryButton: {
     fontFamily: "'Cormorant Garamond', serif",
     fontSize: '16px',
@@ -945,7 +1047,6 @@ const styles = {
     padding: '14px 32px',
     borderRadius: '8px',
     cursor: 'pointer',
-    transition: 'all 0.3s ease',
     boxShadow: '0 4px 12px rgba(44, 95, 124, 0.3)',
   },
   secondaryButton: {
@@ -958,13 +1059,8 @@ const styles = {
     padding: '12px 24px',
     borderRadius: '8px',
     cursor: 'pointer',
-    transition: 'all 0.3s ease',
   },
-  successContainer: {
-    textAlign: 'center',
-    padding: '60px',
-    animation: 'fadeInUp 0.6s ease-out',
-  },
+  successContainer: { textAlign: 'center', padding: '60px' },
   successIcon: {
     width: '64px',
     height: '64px',
@@ -977,23 +1073,9 @@ const styles = {
     justifyContent: 'center',
     margin: '0 auto 24px',
   },
-  successTitle: {
-    fontFamily: "'Cormorant Garamond', serif",
-    fontSize: '28px',
-    fontWeight: 600,
-    color: '#2C5F7C',
-    marginBottom: '8px',
-  },
-  successText: {
-    fontSize: '14px',
-    color: '#5A6978',
-    marginBottom: '24px',
-  },
-  errorContainer: {
-    textAlign: 'center',
-    padding: '60px',
-    animation: 'fadeInUp 0.6s ease-out',
-  },
+  successTitle: { fontFamily: "'Cormorant Garamond', serif", fontSize: '28px', fontWeight: 600, color: '#2C5F7C', marginBottom: '8px' },
+  successText: { fontSize: '14px', color: '#5A6978', marginBottom: '24px' },
+  errorContainer: { textAlign: 'center', padding: '60px' },
   errorIcon: {
     width: '64px',
     height: '64px',
@@ -1006,32 +1088,11 @@ const styles = {
     justifyContent: 'center',
     margin: '0 auto 24px',
   },
-  errorTitle: {
-    fontFamily: "'Cormorant Garamond', serif",
-    fontSize: '28px',
-    fontWeight: 600,
-    color: '#A63D40',
-    marginBottom: '8px',
-  },
-  errorText: {
-    fontSize: '14px',
-    color: '#5A6978',
-    marginBottom: '24px',
-  },
-  footer: {
-    textAlign: 'center',
-    padding: '40px 20px',
-  },
-  footerOrnament: {
-    fontSize: '16px',
-    color: '#B87333',
-    marginBottom: '12px',
-  },
-  footerText: {
-    fontSize: '12px',
-    color: '#5A6978',
-    letterSpacing: '1px',
-  },
+  errorTitle: { fontFamily: "'Cormorant Garamond', serif", fontSize: '28px', fontWeight: 600, color: '#A63D40', marginBottom: '8px' },
+  errorLog: { fontSize: '12px', color: '#5A6978', fontFamily: 'monospace', marginBottom: '24px', textAlign: 'left', maxWidth: '400px', margin: '0 auto 24px' },
+  footer: { textAlign: 'center', padding: '40px 20px' },
+  footerOrnament: { fontSize: '16px', color: '#B87333', marginBottom: '12px' },
+  footerText: { fontSize: '12px', color: '#5A6978', letterSpacing: '1px' },
 };
 
 ReactDOM.render(<App />, document.getElementById('root'));

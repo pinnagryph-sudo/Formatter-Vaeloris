@@ -1,83 +1,66 @@
-# Vaeloris Document Forge
+# Vaeloris Document Forge v2
 
 A client-side React PWA that transforms your manuscripts into beautifully styled Word documents using the Vaeloris/Bonded Path aesthetic.
 
-## ·  ◊  · Features
+## ·  ◊  · What's New in v2
 
-- **Drag & drop interface** — Upload .docx, .md, or .txt files
-- **Full Vaeloris styling** — Colors, typography, sidebars, tables, and ornaments
-- **Client-side processing** — Everything runs in your browser, no server needed
-- **PWA-ready** — Install as a desktop/mobile app
+- **Direct Word document parsing** — Reads paragraph styles (`Heading1`, `Heading2`, `Heading3`, `FirstParagraph`, `BodyText`) from .docx files
+- **No more markdown markers required** — Works with plain Word documents
+- **Parse log** — Shows exactly what elements were detected
+- **Improved sidebar detection** — Finds `SIDEBAR [X]:` patterns in body text
 
-## Color Palette
+## Supported Input Formats
 
-| Name | Hex | Usage |
-|------|-----|-------|
-| Deep Sea | `#2C5F7C` | Headers, drop caps, SCHOLAR'S NOTE |
-| Storm Gray | `#5A6978` | Subtitles, chapter numbers, REGIONAL VARIATION |
-| Copper | `#B87333` | Ornaments, bullets, FIELD NOTE |
-| Rust Red | `#A63D40` | WARDEN'S WARNING |
-| Olive | `#6B8E23` | HEALER'S NOTE |
-| Warm Sand | `#F7F3EB` | Backgrounds |
+### Word Documents (.docx)
+The parser reads Word paragraph styles:
+- `Heading1` → Book title with ornaments
+- `Heading2` containing "Chapter" → Chapter header with page break
+- `Heading2` (other) → Subtitle
+- `Heading3` → Section header
+- `FirstParagraph` → Drop cap paragraph
+- `BodyText` → Regular paragraph
 
-## Supported Markdown Patterns
+It also detects text patterns:
+- `SIDEBAR [X]: Title (Reliability: High)` → Styled sidebar box
+- `Source:`, `Compiled from:`, `Applies to:` → Sidebar fields
+- Lines starting with `"` → Sidebar quotes
+- `| col | col |` → Tables with styled headers
 
-### Headers
-```markdown
-# BOOK ONE
-## Chapter 1: The Beginning
-### Section Title
-#### Subsection
-```
+### Markdown/Text (.md, .txt)
+Use these markers:
+- `# BOOK ONE` → Book title
+- `## Chapter 1: Title` → Chapter header
+- `### Section` → Section header
+- `**SIDEBAR [V]: Title** (Reliability: High)` → Sidebar
 
-### Sidebars
-```markdown
-**SIDEBAR [V]: Medical Warning** (Reliability: High)
+## Sidebar Codes
 
-Source: Healer's Guild
-
-_"Always consult a professional before..."_
-```
-
-Sidebar codes:
-- **A, E, L, Q** → SCHOLAR'S NOTE (Teal)
-- **B, F** → FIELD NOTE (Copper)
-- **D, S, W** → WARDEN'S WARNING (Red)
-- **V** → HEALER'S NOTE (Olive)
-- **R** → REGIONAL VARIATION (Gray)
-
-### Tables
-```markdown
-| Region | Climate |
-|--------|---------|
-| Redreed Delta | Humid |
-| Skyspine Range | Cold |
-```
-
-### Definitions
-```markdown
-**Climate:** Hot and arid
-```
+| Code | Style | Color |
+|------|-------|-------|
+| A, E, L, Q | SCHOLAR'S NOTE | Teal #2C5F7C |
+| B, F | FIELD NOTE | Copper #B87333 |
+| D, S, W | WARDEN'S WARNING | Red #A63D40 |
+| V | HEALER'S NOTE | Olive #6B8E23 |
+| R | REGIONAL VARIATION | Gray #5A6978 |
 
 ## Running Locally
 
-1. Serve the files with any static server:
-   ```bash
-   npx serve .
-   # or
-   python -m http.server 8000
-   ```
+```bash
+# Option 1: npx serve
+npx serve .
 
-2. Open in browser (e.g., http://localhost:8000)
+# Option 2: Python
+python -m http.server 8000
+```
 
-3. Drop in your files and forge!
+Then open http://localhost:8000
 
-## Dependencies (loaded via CDN)
+## Dependencies (CDN)
 
 - React 18
-- mammoth.js (docx text extraction)
+- JSZip (docx parsing)
 - docx (Word document generation)
-- FileSaver.js (download handling)
+- FileSaver.js
 
 ## ─────────  ◊  ─────────
 
