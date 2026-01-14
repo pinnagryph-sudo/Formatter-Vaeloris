@@ -93,6 +93,8 @@ async function parseDocxFile(file) {
   const bodyChildren = body.childNodes;
   
   let isFirstParagraphAfterChapter = false;
+  let isFirstParagraphAfterHeader = false;
+  let isAfterLabel = false;
   let currentSidebar = null;
   
   for (let i = 0; i < bodyChildren.length; i++) {
@@ -218,6 +220,7 @@ async function parseDocxFile(file) {
     // Section headers (Heading3, Heading4)
     if (style === 'Heading3') {
       elements.push({ type: 'header', level: 3, text: text });
+      isFirstParagraphAfterHeader = true;  // Next para gets drop cap
       continue;
     }
     if (style === 'Heading4') {
@@ -225,10 +228,16 @@ async function parseDocxFile(file) {
       continue;
     }
     
+    // BlockText style = list items (indented/bullet content)
+    if (style === 'BlockText') {
+      elements.push({ type: 'bullet', text: text });
+      continue;
+    }
+    
     // Check for table rows (markdown-style pipes) - only for .md/.txt files
     // Word tables are handled above as <w:tbl> elements
     
-    // Bullet points
+    // Bullet points (explicit markers in text)
     if (text.match(/^[\d]+\.\s+/) || text.match(/^[-•]\s+/)) {
       elements.push({ 
         type: 'bullet', 
@@ -237,21 +246,44 @@ async function parseDocxFile(file) {
       continue;
     }
     
-    // Definition pattern (Term: value)
-    const defMatch = text.match(/^([A-Z][^:]{2,30}):\s+(.+)$/);
-    if (defMatch && !text.includes('SIDEBAR')) {
-      elements.push({ type: 'definition', term: defMatch[1], value: defMatch[2] });
+    // Label detection: short text ending with colon (introduces a list)
+    // Examples: "Behavior:", "Management:", "Recognition signs:"
+    if (text.match(/^[A-Z][^:]{0,40}:$/) && text.length < 50) {
+      elements.push({ type: 'label', text: text });
+      isAfterLabel = true;
       continue;
     }
     
-    // First paragraph after chapter gets drop cap
-    if ((style === 'FirstParagraph' || isFirstParagraphAfterChapter) && /^[A-Z]/.test(text)) {
+    // Short paragraphs after a label = list items
+    if (isAfterLabel && text.length < 80 && !text.endsWith(':')) {
+      elements.push({ type: 'bullet', text: text });
+      continue;
+    }
+    
+    // Reset label tracking on longer paragraphs
+    if (text.length >= 80) {
+      isAfterLabel = false;
+    }
+    
+    // Definition pattern (Term: value) - inline definition, not a label
+    const defMatch = text.match(/^([A-Z][^:]{2,30}):\s+(.+)$/);
+    if (defMatch && !text.includes('SIDEBAR') && defMatch[2].length > 10) {
+      elements.push({ type: 'definition', term: defMatch[1], value: defMatch[2] });
+      isAfterLabel = false;
+      continue;
+    }
+    
+    // First paragraph after chapter or section header gets drop cap
+    if ((style === 'FirstParagraph' || isFirstParagraphAfterChapter || isFirstParagraphAfterHeader) && /^[A-Z]/.test(text)) {
       elements.push({ type: 'dropCapParagraph', text: text });
       isFirstParagraphAfterChapter = false;
+      isFirstParagraphAfterHeader = false;
+      isAfterLabel = false;
       continue;
     }
     
     // Regular paragraph
+    isAfterLabel = false;
     elements.push({ type: 'paragraph', text: text });
   }
   
@@ -505,9 +537,20 @@ function generateDocument(elements) {
         }));
         break;
 
+      case 'label':
+        // Bold label that introduces a list (e.g., "Behavior:", "Management:")
+        children.push(new Paragraph({
+          spacing: { after: 80 },
+          children: [
+            new TextRun({ text: cleanText(el.text), bold: true, color: COLORS.darkGray, size: 24 })
+          ]
+        }));
+        break;
+
       case 'bullet':
         children.push(new Paragraph({
           spacing: { after: 120 },
+          indent: { left: 720, hanging: 360 },  // Proper list indentation
           children: [
             new TextRun({ text: '• ', color: COLORS.copper, size: 24 }),
             new TextRun({ text: cleanText(el.text), color: COLORS.darkGray, size: 24 })
@@ -606,9 +649,9 @@ function generateDocument(elements) {
         // Add spacing before sidebar
         children.push(new Paragraph({ spacing: { after: 120 } }));
         
-        // Create sidebar table
+        // Create sidebar table (9360 twips = 6.5 inches, full content width)
         children.push(new Table({
-          width: { size: 5000, type: WidthType.PERCENTAGE },
+          width: { size: 9360, type: WidthType.DXA },
           rows: [
             new TableRow({
               children: [
@@ -676,7 +719,7 @@ function generateDocument(elements) {
 
         children.push(new Paragraph({ spacing: { after: 120 } }));
         children.push(new Table({
-          width: { size: 5000, type: WidthType.PERCENTAGE },
+          width: { size: 9360, type: WidthType.DXA },
           rows: tableRows
         }));
         children.push(new Paragraph({ spacing: { after: 200 } }));
